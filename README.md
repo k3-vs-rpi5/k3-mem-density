@@ -15,6 +15,30 @@ It reports three densities plus the locating views:
 | width | histogram of allocation sizes and page-allocation orders | `bytes_alloc` of the kmalloc events, `order` of `mm_page_alloc` |
 | space and depth | page-fault frequency split into read and write faults, plus direct-reclaim and kswapd pressure per second | `error_code` of the fault events, vmscan events |
 | locating | top processes by allocation and fault activity, and the top kernel stacks that request memory | per-pid aggregation and `bpf_get_stackid` |
+| allocation-layer bottlenecks | lock contention rate, zone-locked page allocations, fragmentation fallbacks and per-CPU page-list churn, with the most contended lock and the top contention stacks | `lock:contention_begin`, `lock:contention_end`, `kmem:mm_page_alloc_zone_locked`, `kmem:mm_page_alloc_extfrag`, `kmem:mm_page_free_batched`, `kmem:mm_page_pcpu_drain` |
+| hardware saturation | IPC, L1D load miss ratio, MPKI and the beyond-L1 traffic estimate the LLC and memory system actually see, with a utilisation figure against a calibrated peak | the SoC PMU (`cycles`, `instructions`, `L1-dcache-*`) |
+
+## Software bottleneck view versus hardware saturation view
+
+The two halves answer different questions and are reported separately:
+
+- **allocation-layer bottlenecks** are the software signals: SLUB per-cache lock
+  contention (`lock:contention_begin`, with the contended lock address and the
+  stack that fights for it), the buddy allocator zone-lock path
+  (`kmem:mm_page_alloc_zone_locked`), buddy fragmentation fallbacks
+  (`kmem:mm_page_alloc_extfrag`, reported as alloc order to fallback order) and
+  per-CPU page-list churn (`mm_page_free_batched`, `mm_page_pcpu_drain`).
+- **hardware saturation** is the memory-system signal: beyond-L1 traffic, which
+  is what the LLC and the memory controller see, derived from the L1D load and
+  store miss counters times the 64 B cache line, together with MPKI and IPC.
+  Calibrate the peak once with `--probe-bandwidth` and the report becomes a bus
+  utilisation percentage.
+
+This SoC exposes **no LLC and no memory-controller counters** (`LLC-*` and
+`dTLB-*` are not provided by the PMU, and the `rvtrace` PMU only encodes
+trace), so LLC-miss density and DDR saturation cannot be read directly. The
+beyond-L1 traffic estimate is the closest observable quantity and is always
+labelled as an estimate, never presented as a raw counter.
 
 ## How it works on this board
 
@@ -37,6 +61,7 @@ board's own `libbpf`. Nothing has to be installed on the board.
 ```sh
 hardware/k3-mem-density/scripts/build.sh
 hardware/k3-mem-density/scripts/run.sh --check
+hardware/k3-mem-density/scripts/run.sh --probe-bandwidth --seconds 3
 hardware/k3-mem-density/scripts/run.sh --seconds 30 --workload \
   --evidence /root/k3-evidence/k3-mem-density/<run-id>
 ```
@@ -46,6 +71,10 @@ hardware/k3-mem-density/scripts/run.sh --seconds 30 --workload \
 exercised on demand. `--evidence` copies the raw report outside every Git
 repository. Board access uses the workspace record `<workspace>/.ssh-k3`, which
 must be mode `0600` and is never printed.
+
+`--probe-bandwidth` measures the achievable streaming bandwidth of the board so
+the saturation figure has a reference; `--peak-mib-s` supplies a known peak
+instead, and `--pid` restricts the hardware view to one process.
 
 ## Installed service
 
@@ -62,6 +91,11 @@ must be mode `0600` and is never printed.
 | reclaim | 0 in steady state, 16-18 events/s during the allocation storm |
 | widest bucket | 256-512 B (47.6 % of allocations) |
 | top allocator | the synthetic workload, 28.7 MiB in 52 k allocations |
+| lock contention | 425 begins in 14 s (30/s) during the threaded allocation workload |
+| zone-locked page allocations | 913 k in 14 s (65 k/s), the buddy zone-lock path |
+| fragmentation fallbacks | 42, seen as order 0 falling back to order 4, 6 and 7 |
+| beyond-L1 traffic | 136-138 MiB/s at 1.0 % L1D load miss and MPKI 0.26-0.30 |
+| single-core streaming peak | 10151 MiB/s of read+write traffic |
 
 ## Limitations
 
@@ -71,6 +105,9 @@ must be mode `0600` and is never printed.
   which is exactly what the page-order histogram shows.
 - Reclaim pressure is only visible when the board is actually under pressure;
   an idle board reports zero, which is correct rather than missing.
+- LLC misses and DDR saturation have no counters on this SoC; the beyond-L1
+  traffic estimate is a lower bound of memory-system traffic, because prefetch
+  and hardware-initiated traffic are not counted.
 
 ## Workspace integration
 

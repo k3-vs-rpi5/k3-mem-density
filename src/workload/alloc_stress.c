@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -22,33 +23,69 @@ static double now_seconds(void)
 	return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
+static int workload_seconds = 5;
+static size_t block_bytes;
+static volatile int stop_flag;
+
+/* Concurrent allocators on purpose: a single thread rarely contends on the
+ * per-cache SLUB lock or the buddy zone lock, so the default is several
+ * threads fighting for the same size class. */
+static void *allocator(void *arg)
+{
+	long id = (long)arg;
+	unsigned long long rounds = 0;
+	char path[64];
+	int fd;
+
+	snprintf(path, sizeof(path), "/tmp/k3-mem-density-workload-%ld.bin", id);
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	while (!stop_flag) {
+		char *buffer = malloc(block_bytes);
+
+		if (!buffer)
+			break;
+		memset(buffer, (int)(rounds & 0x7f), block_bytes);
+		if (fd >= 0 && (rounds & 0x3f) == 0)
+			(void)!write(fd, buffer, block_bytes);
+		free(buffer);
+		rounds++;
+	}
+	if (fd >= 0)
+		close(fd);
+	return (void *)(intptr_t)rounds;
+}
+
 int main(int argc, char **argv)
 {
 	int seconds = argc > 1 ? atoi(argv[1]) : 5;
 	int block_kib = argc > 2 ? atoi(argv[2]) : 64;
-	size_t block = (size_t)block_kib * 1024;
-	double deadline = now_seconds() + seconds;
-	unsigned long long rounds = 0, bytes = 0;
-	int fd = open("/tmp/k3-mem-density-workload.bin", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	int threads = argc > 3 ? atoi(argv[3]) : 4;
+	pthread_t workers[64];
+	unsigned long long rounds = 0;
 
-	while (now_seconds() < deadline) {
-		char *buffer = malloc(block);
+	if (threads < 1)
+		threads = 1;
+	if (threads > 64)
+		threads = 64;
+	workload_seconds = seconds;
+	block_bytes = (size_t)block_kib * 1024;
 
-		if (!buffer) {
-			fprintf(stderr, "allocation failed\n");
+	for (long index = 0; index < threads; index++)
+		if (pthread_create(&workers[index], NULL, allocator, (void *)index) != 0) {
+			fprintf(stderr, "cannot start thread %ld\n", index);
 			return 1;
 		}
-		/* write every page: read-modify-write faults, then hand pages back */
-		memset(buffer, (int)(rounds & 0x7f), block);
-		if (fd >= 0)
-			(void)!write(fd, buffer, block);
-		free(buffer);
-		rounds++;
-		bytes += block;
+	for (int elapsed = 0; elapsed < workload_seconds; elapsed++)
+		sleep(1);
+	stop_flag = 1;
+	for (int index = 0; index < threads; index++) {
+		void *result = NULL;
+
+		pthread_join(workers[index], &result);
+		rounds += (unsigned long long)(intptr_t)result;
 	}
-	if (fd >= 0)
-		close(fd);
-	printf("alloc_stress: rounds=%llu bytes=%llu (%.1f MiB/s)\n", rounds, bytes,
-	       bytes / 1048576.0 / (double)seconds);
+	printf("alloc_stress: threads=%d block=%d KiB rounds=%llu bytes=%llu (%.1f MiB/s)\n",
+	       threads, block_kib, rounds, rounds * block_bytes,
+	       rounds * block_bytes / 1048576.0 / (double)(workload_seconds ? workload_seconds : 1));
 	return 0;
 }

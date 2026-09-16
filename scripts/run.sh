@@ -22,13 +22,18 @@ SECONDS_WINDOW=30
 WORKLOAD=0
 CHECK=0
 EVIDENCE=
+EXTRA=
 while [ $# -gt 0 ]; do
     case "$1" in
         --seconds) SECONDS_WINDOW=$2; shift 2 ;;
         --workload) WORKLOAD=1; shift ;;
         --check) CHECK=1; shift ;;
         --evidence) EVIDENCE=$2; shift 2 ;;
-        *) echo "usage: $0 [--seconds N] [--workload] [--check] [--evidence DIR]" >&2
+        --probe-bandwidth) EXTRA="$EXTRA --probe-bandwidth"; shift ;;
+        --peak-mib-s) EXTRA="$EXTRA --peak-mib-s $2"; shift 2 ;;
+        --pid) EXTRA="$EXTRA --pid $2"; shift 2 ;;
+        *) echo "usage: $0 [--seconds N] [--workload] [--check] [--probe-bandwidth]" >&2
+           echo "          [--peak-mib-s N] [--pid PID] [--evidence DIR]" >&2
            exit 2 ;;
     esac
 done
@@ -70,15 +75,17 @@ sshpass -e scp -q $SSH_OPTS \
     "$DEST:$STAGE/"
 
 if [ "$CHECK" = 1 ]; then
-    if remote "cd $STAGE && ./mem_density --object ./mem_density.bpf.o --check"; then
+    if remote "cd $STAGE && ./mem_density --object ./mem_density.bpf.o --check $EXTRA"; then
         exit 0
     fi
     exit 1
 fi
 
-RUN="cd $STAGE && ./mem_density --object ./mem_density.bpf.o --seconds $SECONDS_WINDOW --json report.json"
+RUN="cd $STAGE && ./mem_density --object ./mem_density.bpf.o --seconds $SECONDS_WINDOW --json report.json $EXTRA"
 if [ "$WORKLOAD" = 1 ]; then
-    RUN="cd $STAGE && (./alloc_stress $((SECONDS_WINDOW - 1)) 128 &) && $RUN"
+    # several concurrent allocators so SLUB/zone contention and fragmentation
+    # show up instead of a single thread's private fast path
+    RUN="cd $STAGE && (./alloc_stress $((SECONDS_WINDOW - 1)) 256 6 &) && $RUN"
 fi
 remote "$RUN" | tee "$BUILD/report.txt"
 sshpass -e scp -q $SSH_OPTS "$DEST:$STAGE/report.json" "$BUILD/report.json" || true

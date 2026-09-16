@@ -42,7 +42,7 @@ mkdir -p "$OUT"
     -lbpf -lelf -lz -lzstd \
     -Wl,-rpath-link="$LIBBPF_DIR" -Wl,-rpath,/usr/lib/riscv64-linux-gnu
 
-"$TOOLCHAIN/bin/riscv64-unknown-linux-gnu-gcc" -O2 -Wall \
+"$TOOLCHAIN/bin/riscv64-unknown-linux-gnu-gcc" -O2 -Wall -pthread \
     --sysroot="$TOOLCHAIN/sysroot" \
     -o "$OUT/alloc_stress" "$ROOT/src/workload/alloc_stress.c"
 

@@ -14,6 +14,26 @@
 | 宽度 | 分配大小直方图与页分配 order 直方图 | kmalloc 事件的 `bytes_alloc`、`mm_page_alloc` 的 `order` |
 | 空间与深度 | 缺页频率（读写分开）以及每秒直接回收与 kswapd 压力 | 缺页事件的 `error_code`、vmscan 事件 |
 | 定位 | 按进程的分配与缺页排名，以及申请内存最多的内核栈 | 按 pid 聚合与 `bpf_get_stackid` |
+| 分配层瓶颈 | 锁竞争速率、持 zone 锁的页分配、碎片回退、每 CPU 页链表抖动，含最热竞争锁与竞争栈 | `lock:contention_begin`、`lock:contention_end`、`kmem:mm_page_alloc_zone_locked`、`kmem:mm_page_alloc_extfrag`、`kmem:mm_page_free_batched`、`kmem:mm_page_pcpu_drain` |
+| 硬件饱和 | IPC、L1D 读缺失率、MPKI，以及 LLC 与内存系统实际看到的“越过 L1”流量估算，并可对照标定峰值给出利用率 | SoC PMU（`cycles`、`instructions`、`L1-dcache-*`） |
+
+## 软件瓶颈视图与硬件饱和视图
+
+两部分回答不同问题，因此分开报告：
+
+- **分配层瓶颈**是软件侧信号：SLUB 每缓存锁竞争（`lock:contention_begin`，含竞争锁
+  地址与争夺它的调用栈）、伙伴系统的 zone 锁路径
+  （`kmem:mm_page_alloc_zone_locked`）、伙伴系统碎片回退
+  （`kmem:mm_page_alloc_extfrag`，报告为分配 order → 回退 order），以及每 CPU 页
+  链表抖动（`mm_page_free_batched`、`mm_page_pcpu_drain`）。
+- **硬件饱和**是内存系统侧信号：越过 L1 的流量，也就是 LLC 与内存控制器看到的
+  流量，由 L1D 读/写缺失计数乘以 64 B 缓存行估算，同时给出 MPKI 与 IPC。用
+  `--probe-bandwidth` 标定一次峰值后，报告会给出总线利用率百分比。
+
+本 SoC **没有 LLC 计数器，也没有内存控制器计数器**（PMU 不提供 `LLC-*` 与
+`dTLB-*`，`rvtrace` PMU 只用于 trace 编码），因此 LLC 缺失密度与 DDR 饱和度无法
+直接读取。越过 L1 的流量估算是当前可观测的最近似量，且始终标注为估算值，绝不冒
+充为原始计数器。
 
 ## 在本板上的实现方式
 
@@ -33,6 +53,7 @@ eBPF 程序在主机上用 `clang-23 -target bpf` 编译；加载器用工作区
 ```sh
 hardware/k3-mem-density/scripts/build.sh
 hardware/k3-mem-density/scripts/run.sh --check
+hardware/k3-mem-density/scripts/run.sh --probe-bandwidth --seconds 3
 hardware/k3-mem-density/scripts/run.sh --seconds 30 --workload \
   --evidence /root/k3-evidence/k3-mem-density/<run-id>
 ```
@@ -41,6 +62,9 @@ hardware/k3-mem-density/scripts/run.sh --seconds 30 --workload \
 运行自带的合成分配负载，按需触发四种密度。`--evidence` 会把原始报告复制到所有
 Git 仓库之外。板卡访问使用工作区记录 `<workspace>/.ssh-k3`，该文件必须是
 `0600`，且绝不打印其内容。
+
+`--probe-bandwidth` 测量板卡可达到的流式带宽，为饱和率提供参照；`--peak-mib-s`
+可用已知峰值代替；`--pid` 把硬件视图限制在某一个进程上。
 
 ## 常驻服务
 
@@ -57,12 +81,19 @@ Git 仓库之外。板卡访问使用工作区记录 `<workspace>/.ssh-k3`，该
 | 回收 | 稳态为 0，分配风暴期间 16–18 次/秒 |
 | 最宽区间 | 256–512 B（占分配次数 47.6 %） |
 | 最大分配者 | 合成负载，52 k 次分配共 28.7 MiB |
+| 锁竞争 | 线程化分配负载下 14 秒内 425 次开始（30 次/秒） |
+| 持 zone 锁的页分配 | 14 秒内 913 k 次（65 k 次/秒），即伙伴系统 zone 锁路径 |
+| 碎片回退 | 42 次，表现为 order 0 回退到 order 4、6、7 |
+| 越过 L1 流量 | 136–138 MiB/s，L1D 读缺失 1.0 %、MPKI 0.26–0.30 |
+| 单核流式峰值 | 读+写合计 10151 MiB/s |
 
 ## 限制
 
 - 内存读写操作本身不可直接观测；工具改为报告缺页的读/写密度与读写系统调用密度。
 - 大块分配会绕过 `kmalloc`（直接走页分配器），这正是页 order 直方图所显示的。
 - 回收压力只在板卡真正有压力时可见；空闲板卡报告为 0 是正确结果，而不是缺失。
+- 本 SoC 没有 LLC 与 DDR 饱和度计数器；越过 L1 的流量估算是内存系统流量的下限，
+  因为预取与硬件发起的流量未计入。
 
 ## 工作区集成
 

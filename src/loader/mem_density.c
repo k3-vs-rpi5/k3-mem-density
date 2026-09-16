@@ -34,6 +34,120 @@
 #include <unistd.h>
 
 #define MAX_ATTACH_FDS 256
+#define MAX_PMU_GROUPS 16
+#define PMU_EVENTS 6
+#define CACHE_LINE_BYTES 64
+
+/* Hardware-saturation view. The SoC exposes no LLC or memory-controller
+ * counters (verified: LLC-* and dTLB-* are not provided by this PMU), so the
+ * tool derives the beyond-L1 traffic from the L1D miss counters, which is
+ * exactly the traffic the LLC and the memory system see. */
+static const char *pmu_event_names[PMU_EVENTS] = {
+	"cycles", "instructions", "L1d_loads", "L1d_load_misses", "L1d_stores",
+	"L1d_store_misses",
+};
+
+/* PERF_TYPE_HW_CACHE config = id | (op << 8) | (result << 16) */
+#define K3_CACHE_CONFIG(id, op, result) \
+	((__u64)(id) | ((__u64)(op) << 8) | ((__u64)(result) << 16))
+
+static const __u64 pmu_event_config[PMU_EVENTS] = {
+	PERF_COUNT_HW_CPU_CYCLES,
+	PERF_COUNT_HW_INSTRUCTIONS,
+	K3_CACHE_CONFIG(PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_OP_READ,
+			PERF_COUNT_HW_CACHE_RESULT_ACCESS),
+	K3_CACHE_CONFIG(PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_OP_READ,
+			PERF_COUNT_HW_CACHE_RESULT_MISS),
+	K3_CACHE_CONFIG(PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_OP_WRITE,
+			PERF_COUNT_HW_CACHE_RESULT_ACCESS),
+	K3_CACHE_CONFIG(PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_OP_WRITE,
+			PERF_COUNT_HW_CACHE_RESULT_MISS),
+};
+
+struct pmu_group {
+	int fd[PMU_EVENTS];
+	int cpu;
+};
+
+static int pmu_open_group(int cpu, int pid, struct pmu_group *group)
+{
+	int group_fd = -1;
+
+	group->cpu = cpu;
+	for (int index = 0; index < PMU_EVENTS; index++) {
+		struct perf_event_attr attr;
+		int fd;
+
+		memset(&attr, 0, sizeof(attr));
+		attr.type = index < 2 ? PERF_TYPE_HARDWARE : PERF_TYPE_HW_CACHE;
+		attr.size = sizeof(attr);
+		attr.config = pmu_event_config[index];
+		attr.disabled = 1;
+		attr.inherit = pid > 0 ? 1 : 0;
+		fd = (int)syscall(__NR_perf_event_open, &attr, pid > 0 ? pid : -1,
+				  pid > 0 ? -1 : cpu, group_fd, PERF_FLAG_FD_CLOEXEC);
+		group->fd[index] = fd;
+		if (fd < 0) {
+			for (int previous = 0; previous < index; previous++)
+				if (group->fd[previous] >= 0)
+					close(group->fd[previous]);
+			return -1;
+		}
+		if (group_fd < 0)
+			group_fd = fd;
+	}
+	for (int index = 0; index < PMU_EVENTS; index++) {
+		ioctl(group->fd[index], PERF_EVENT_IOC_RESET, 0);
+		ioctl(group->fd[index], PERF_EVENT_IOC_ENABLE, 0);
+	}
+	return 0;
+}
+
+static void pmu_read_group(struct pmu_group *group, __u64 *values)
+{
+	for (int index = 0; index < PMU_EVENTS; index++) {
+		__u64 value = 0;
+
+		if (group->fd[index] >= 0 && read(group->fd[index], &value, sizeof(value)) < 0)
+			value = 0;
+		values[index] += value;
+	}
+}
+
+static void pmu_close_group(struct pmu_group *group)
+{
+	for (int index = 0; index < PMU_EVENTS; index++)
+		if (group->fd[index] >= 0)
+			close(group->fd[index]);
+}
+
+/* Measure the achievable streaming bandwidth of this board so the probe can
+ * report a utilisation figure. Read+write bytes over the elapsed time. */
+static double probe_stream_bandwidth(int seconds, int threads)
+{
+	size_t size = 64u * 1024u * 1024u;
+	unsigned char *buffer = malloc(size);
+	struct timespec start, stamp;
+	unsigned long long passes = 0;
+	double elapsed;
+
+	if (!buffer)
+		return 0.0;
+	memset(buffer, 1, size);
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	do {
+		for (size_t index = 0; index < size; index += CACHE_LINE_BYTES)
+			buffer[index] = (unsigned char)(buffer[index] + 1);
+		passes++;
+		clock_gettime(CLOCK_MONOTONIC, &stamp);
+		elapsed = (stamp.tv_sec - start.tv_sec) + (stamp.tv_nsec - start.tv_nsec) / 1e9;
+	} while (elapsed < seconds);
+	free(buffer);
+	(void)threads;
+	/* each pass reads and writes one cache line per step */
+	return (double)passes * (double)size * 2.0 / elapsed / (1024.0 * 1024.0);
+}
+
 
 static int attach_fds[MAX_ATTACH_FDS];
 static int attach_fd_count;
@@ -230,6 +344,12 @@ enum total_slot {
 	TOTAL_WRITE_BYTES,
 	TOTAL_KMEM_CACHE_ALLOC_OPS,
 	TOTAL_KMEM_CACHE_FREE_OPS,
+	TOTAL_CONTENTION_BEGIN,
+	TOTAL_CONTENTION_END,
+	TOTAL_EXTFRAG,
+	TOTAL_ZONE_LOCKED,
+	TOTAL_FREE_BATCHED,
+	TOTAL_PCPU_DRAIN,
 	TOTAL_SLOTS
 };
 
@@ -250,6 +370,12 @@ static const char *total_names[TOTAL_SLOTS] = {
 	[TOTAL_WRITE_BYTES] = "write_bytes",
 	[TOTAL_KMEM_CACHE_ALLOC_OPS] = "kmem_cache_alloc_ops",
 	[TOTAL_KMEM_CACHE_FREE_OPS] = "kmem_cache_free_ops",
+	[TOTAL_CONTENTION_BEGIN] = "lock_contention_begin",
+	[TOTAL_CONTENTION_END] = "lock_contention_end",
+	[TOTAL_EXTFRAG] = "page_alloc_extfrag",
+	[TOTAL_ZONE_LOCKED] = "page_alloc_zone_locked",
+	[TOTAL_FREE_BATCHED] = "page_free_batched",
+	[TOTAL_PCPU_DRAIN] = "page_pcpu_drain",
 };
 
 struct layout_expectation {
@@ -273,6 +399,9 @@ static const struct layout_expectation expected_layouts[] = {
 	{ "tp/syscalls/sys_enter_read", "count", 32 },
 	{ "tp/syscalls/sys_enter_write", "fd", 16 },
 	{ "tp/syscalls/sys_enter_write", "count", 32 },
+	{ "tp/lock/contention_begin", "lock_addr", 8 },
+	{ "tp/kmem/mm_page_alloc_extfrag", "alloc_order", 16 },
+	{ "tp/kmem/mm_page_alloc_extfrag", "fallback_order", 20 },
 };
 
 static int verify_layout(const char *section, const char *group, const char *event)
@@ -517,6 +646,9 @@ int main(int argc, char **argv)
 	const char *object_path = "/usr/local/lib/k3-mem-density/mem_density.bpf.o";
 	const char *json_path = NULL;
 	int seconds = 10, interval = 1, top = 5, check_only = 0;
+	double peak_mib_s = 0.0;
+	int probe_bandwidth = 0;
+	int watch_pid = 0;
 	struct bpf_object *object = NULL;
 	struct bpf_program *program;
 	int attached = 0, failed = 0;
@@ -537,14 +669,28 @@ int main(int argc, char **argv)
 			json_path = argv[++index];
 		else if (strcmp(argv[index], "--check") == 0)
 			check_only = 1, seconds = 1, interval = 1;
+		else if (strcmp(argv[index], "--peak-mib-s") == 0 && index + 1 < argc)
+			peak_mib_s = atof(argv[++index]);
+		else if (strcmp(argv[index], "--probe-bandwidth") == 0)
+			probe_bandwidth = 1;
+		else if (strcmp(argv[index], "--pid") == 0 && index + 1 < argc)
+			watch_pid = atoi(argv[++index]);
 		else {
 			fprintf(stderr, "usage: %s [--object PATH] [--seconds N] [--interval S] "
-					"[--top N] [--json PATH] [--check]\n", argv[0]);
+					"[--top N] [--json PATH] [--check] [--probe-bandwidth] "
+					"[--peak-mib-s N]\n", argv[0]);
 			return 2;
 		}
 	}
 	if (interval < 1)
 		interval = 1;
+	if (probe_bandwidth) {
+		double measured = probe_stream_bandwidth(seconds < 2 ? 2 : seconds, 1);
+
+		printf("streaming bandwidth probe: %.0f MiB/s of read+write traffic\n", measured);
+		printf("use it to size the saturations: --peak-mib-s %.0f\n", measured);
+		return measured > 0.0 ? 0 : 1;
+	}
 
 	libbpf_set_print(libbpf_log);
 	object = bpf_object__open_file(object_path, NULL);
@@ -625,6 +771,26 @@ int main(int argc, char **argv)
 	printf("k3-mem-density: attached %d eBPF programs (%d unavailable)\n", attached, failed);
 	int samples = 0;
 	struct timespec start, stamp;
+
+	/* Hardware saturation: one PMU group per X100 core (or on the watched
+	 * process). Cores 8-15 are the A100 cluster and stay out of this view. */
+	struct pmu_group pmu_groups[MAX_PMU_GROUPS];
+	int pmu_group_count = 0;
+	__u64 pmu_before[PMU_EVENTS] = { 0 }, pmu_after[PMU_EVENTS] = { 0 };
+	__u64 pmu_during[PMU_EVENTS] = { 0 };
+
+	if (watch_pid > 0) {
+		if (pmu_open_group(-1, watch_pid, &pmu_groups[0]) == 0)
+			pmu_group_count = 1;
+	} else {
+		for (int cpu = 0; cpu < 8 && pmu_group_count < MAX_PMU_GROUPS; cpu++) {
+			if (pmu_open_group(cpu, -1, &pmu_groups[pmu_group_count]) == 0)
+				pmu_group_count++;
+		}
+	}
+	if (pmu_group_count > 0)
+		for (int index = 0; index < pmu_group_count; index++)
+			pmu_read_group(&pmu_groups[index], pmu_before);
 
 	clock_gettime(CLOCK_MONOTONIC, &start);
 	for (int elapsed = 0; elapsed < seconds; elapsed += interval) {
@@ -749,6 +915,172 @@ int main(int argc, char **argv)
 			free(ids);
 			free(counts);
 		}
+	}
+
+	/* Kernel allocation-layer bottlenecks: lock contention and fragmentation. */
+	__u64 contention = 0, extension_frag = 0, zone_locked = 0, batched = 0, drained = 0;
+	{
+		__u64 totals_final[TOTAL_SLOTS] = { 0 };
+
+		if (read_totals(bpf_map__fd(totals_map), totals_final) == 0) {
+			contention = totals_final[TOTAL_CONTENTION_BEGIN];
+			extension_frag = totals_final[TOTAL_EXTFRAG];
+			zone_locked = totals_final[TOTAL_ZONE_LOCKED];
+			batched = totals_final[TOTAL_FREE_BATCHED];
+			drained = totals_final[TOTAL_PCPU_DRAIN];
+		}
+	}
+	printf("\nallocation-layer bottlenecks (totals for this window)\n");
+	printf("  lock contention begins : %llu  (%.2f/s)\n",
+	       (unsigned long long)contention,
+	       seconds > 0 ? (double)contention / seconds : 0.0);
+	printf("  zone-locked page allocs: %llu  (%.2f/s)  [buddy zone lock path]\n",
+	       (unsigned long long)zone_locked,
+	       seconds > 0 ? (double)zone_locked / seconds : 0.0);
+	printf("  fragmentation fallbacks: %llu  [buddy had to fall back on order/migratetype]\n",
+	       (unsigned long long)extension_frag);
+	printf("  batched frees / pcpu drains: %llu / %llu  [per-CPU page-list churn]\n",
+	       (unsigned long long)batched, (unsigned long long)drained);
+
+	struct bpf_map *pairs_map = bpf_object__find_map_by_name(object, "extfrag_pairs");
+	if (pairs_map) {
+		__u64 pairs[64] = { 0 };
+
+		if (read_array(bpf_map__fd(pairs_map), pairs, 64) == 0) {
+			for (int index = 0; index < 64; index++) {
+				if (!pairs[index])
+					continue;
+				printf("    alloc order %d -> fallback order %d : %llu\n",
+				       index & 0x7, index >> 3,
+				       (unsigned long long)pairs[index]);
+			}
+		}
+	}
+
+	struct bpf_map *locks_map = bpf_object__find_map_by_name(object, "lock_counts");
+	if (locks_map) {
+		struct {
+			__u64 address;
+			__u64 count;
+		} locks[64];
+		int found = 0;
+		__u64 key = 0, next_key;
+		int first = 1;
+		int fd = bpf_map__fd(locks_map);
+
+		while (found < 64 && bpf_map_get_next_key(fd, first ? NULL : &key, &next_key) == 0) {
+			__u64 value = 0;
+
+			first = 0;
+			if (bpf_map_lookup_elem(fd, &next_key, &value) == 0 && value > 0) {
+				locks[found].address = next_key;
+				locks[found].count = value;
+				found++;
+			}
+			key = next_key;
+		}
+		for (int left = 0; left < found; left++)
+			for (int right = left + 1; right < found; right++)
+				if (locks[right].count > locks[left].count) {
+					__u64 swap_address = locks[left].address;
+					__u64 swap_count = locks[left].count;
+
+					locks[left] = locks[right];
+					locks[right].address = swap_address;
+					locks[right].count = swap_count;
+				}
+		printf("  most contended locks:\n");
+		for (int index = 0; index < found && index < top; index++)
+			printf("    0x%llx  %llu contentions  near %s\n",
+			       (unsigned long long)locks[index].address,
+			       (unsigned long long)locks[index].count,
+			       symbol_for(locks[index].address));
+	}
+
+	struct bpf_map *contention_map = bpf_object__find_map_by_name(object, "contention_ops");
+	struct bpf_map *contention_stacks = bpf_object__find_map_by_name(object, "contention_sites");
+	if (contention_map && contention_stacks) {
+		struct {
+			__u32 id;
+			__u64 count;
+		} sites[64];
+		int found = 0;
+		__u64 key = 0, next_key;
+		int first = 1;
+		int fd = bpf_map__fd(contention_map);
+
+		while (found < 64 && bpf_map_get_next_key(fd, first ? NULL : &key, &next_key) == 0) {
+			__u64 value = 0;
+
+			first = 0;
+			if (bpf_map_lookup_elem(fd, &next_key, &value) == 0 && value > 0) {
+				sites[found].id = (__u32)next_key;
+				sites[found].count = value;
+				found++;
+			}
+			key = next_key;
+		}
+		for (int left = 0; left < found; left++)
+			for (int right = left + 1; right < found; right++)
+				if (sites[right].count > sites[left].count) {
+					__u32 swap_id = sites[left].id;
+					__u64 swap_count = sites[left].count;
+
+					sites[left] = sites[right];
+					sites[right].id = swap_id;
+					sites[right].count = swap_count;
+				}
+		printf("  top contention stacks:\n");
+		for (int index = 0; index < found && index < top; index++) {
+			printf("    %llu contentions, stack id %u\n",
+			       (unsigned long long)sites[index].count, sites[index].id);
+			print_stack(bpf_map__fd(contention_stacks), sites[index].id);
+		}
+	}
+
+	/* Hardware saturation from the PMU (beyond-L1 traffic). */
+	if (pmu_group_count > 0) {
+		for (int index = 0; index < pmu_group_count; index++)
+			pmu_read_group(&pmu_groups[index], pmu_after);
+		for (int index = 0; index < PMU_EVENTS; index++)
+			pmu_during[index] = pmu_after[index] - pmu_before[index];
+
+		double cycles = (double)pmu_during[0];
+		double instructions = (double)pmu_during[1];
+		double loads = (double)pmu_during[2];
+		double load_misses = (double)pmu_during[3];
+		double stores = (double)pmu_during[4];
+		double store_misses = (double)pmu_during[5];
+		double seconds_measured = seconds > 0 ? seconds : 1;
+		double beyond_l1_mib_s =
+			(load_misses + store_misses) * CACHE_LINE_BYTES /
+			seconds_measured / (1024.0 * 1024.0);
+
+		printf("\nhardware saturation (X100 cores%s)\n",
+		       watch_pid > 0 ? ", watched process only" : " 0-7");
+		printf("  ipc=%.2f  instructions/s=%.3g  cycles/s=%.3g\n",
+		       cycles > 0 ? instructions / cycles : 0.0,
+		       instructions / seconds_measured, cycles / seconds_measured);
+		printf("  L1d loads/s=%.3g  load-miss=%.2f%%  mpki=%.2f\n",
+		       loads / seconds_measured,
+		       loads > 0 ? 100.0 * load_misses / loads : 0.0,
+		       instructions > 0 ? 1000.0 * load_misses / instructions : 0.0);
+		printf("  L1d stores/s=%.3g  store-miss=%.2f%%\n",
+		       stores / seconds_measured,
+		       stores > 0 ? 100.0 * store_misses / stores : 0.0);
+		printf("  beyond-L1 traffic estimate=%.0f MiB/s (misses x %d B cache line)\n",
+		       beyond_l1_mib_s, CACHE_LINE_BYTES);
+		if (peak_mib_s > 0.0)
+			printf("  estimated bus utilisation=%.1f%% of the supplied %.0f MiB/s peak\n",
+			       100.0 * beyond_l1_mib_s / peak_mib_s, peak_mib_s);
+		else
+			printf("  run --probe-bandwidth to calibrate the peak for a utilisation figure\n");
+		printf("  note: this SoC exposes no LLC or memory-controller counters, so");
+		printf(" LLC misses and DDR saturation are reported as this beyond-L1 estimate\n");
+		for (int index = 0; index < pmu_group_count; index++)
+			pmu_close_group(&pmu_groups[index]);
+	} else {
+		printf("\nhardware saturation: PMU counters unavailable\n");
 	}
 
 	__u64 totals_now[TOTAL_SLOTS] = { 0 };
