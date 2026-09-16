@@ -819,21 +819,26 @@ int main(int argc, char **argv)
 	 * process). Cores 8-15 are the A100 cluster and stay out of this view. */
 	struct pmu_group pmu_groups[MAX_PMU_GROUPS];
 	int pmu_group_count = 0;
-	__u64 pmu_before[PMU_EVENTS] = { 0 }, pmu_after[PMU_EVENTS] = { 0 };
+	__u64 pmu_before[MAX_PMU_GROUPS][PMU_EVENTS] = { { 0 } };
+	__u64 pmu_after[MAX_PMU_GROUPS][PMU_EVENTS] = { { 0 } };
 	__u64 pmu_during[PMU_EVENTS] = { 0 };
 
 	if (watch_pid > 0) {
 		if (pmu_open_group(-1, watch_pid, &pmu_groups[0]) == 0)
 			pmu_group_count = 1;
 	} else {
-		for (int cpu = 0; cpu < 8 && pmu_group_count < MAX_PMU_GROUPS; cpu++) {
+		/* Both clusters: the X100 performance cores (0-7) and the A100 AI cores
+		 * (8-15). Linux does not schedule ordinary tasks on A100 and does not
+		 * account their time, but the hardware counters still count the AI
+		 * runtime's work there, so this is the only way to see A100 activity. */
+		for (int cpu = 0; cpu < 16 && pmu_group_count < MAX_PMU_GROUPS; cpu++) {
 			if (pmu_open_group(cpu, -1, &pmu_groups[pmu_group_count]) == 0)
 				pmu_group_count++;
 		}
 	}
 	if (pmu_group_count > 0)
 		for (int index = 0; index < pmu_group_count; index++)
-			pmu_read_group(&pmu_groups[index], pmu_before);
+			pmu_read_group(&pmu_groups[index], pmu_before[index]);
 
 	clock_gettime(CLOCK_MONOTONIC, &start);
 	for (int elapsed = 0; elapsed < seconds; elapsed += interval) {
@@ -1084,34 +1089,62 @@ int main(int argc, char **argv)
 	/* Hardware saturation from the PMU (beyond-L1 traffic). */
 	if (pmu_group_count > 0) {
 		for (int index = 0; index < pmu_group_count; index++)
-			pmu_read_group(&pmu_groups[index], pmu_after);
-		for (int index = 0; index < PMU_EVENTS; index++)
-			pmu_during[index] = pmu_after[index] - pmu_before[index];
+			pmu_read_group(&pmu_groups[index], pmu_after[index]);
 
-		double cycles = (double)pmu_during[0];
-		double instructions = (double)pmu_during[1];
-		double loads = (double)pmu_during[2];
-		double load_misses = (double)pmu_during[3];
-		double stores = (double)pmu_during[4];
-		double store_misses = (double)pmu_during[5];
+		/* Report the two clusters separately: AI runtimes put their operators on
+		 * the A100 cores (8-15), where Linux accounting shows no user time. */
+		__u64 cluster_during[2][PMU_EVENTS] = { { 0 }, { 0 } };
+		int cluster_cpus[2] = { 0, 0 };
+
+		for (int index = 0; index < pmu_group_count; index++) {
+			int cluster = pmu_groups[index].cpu >= 8 ? 1 : 0;
+
+			cluster_cpus[cluster]++;
+			for (int event = 0; event < PMU_EVENTS; event++) {
+				__u64 delta = pmu_after[index][event] - pmu_before[index][event];
+
+				cluster_during[cluster][event] += delta;
+				pmu_during[event] += delta;
+			}
+		}
+
 		double seconds_measured = seconds > 0 ? seconds : 1;
-		double beyond_l1_mib_s =
-			(load_misses + store_misses) * CACHE_LINE_BYTES /
-			seconds_measured / (1024.0 * 1024.0);
+		double beyond_l1_mib_s = (double)(pmu_during[3] + pmu_during[5]) *
+					 CACHE_LINE_BYTES / seconds_measured / (1024.0 * 1024.0);
 
-		printf("\nhardware saturation (X100 cores%s)\n",
-		       watch_pid > 0 ? ", watched process only" : " 0-7");
-		printf("  ipc=%.2f  instructions/s=%.3g  cycles/s=%.3g\n",
-		       cycles > 0 ? instructions / cycles : 0.0,
-		       instructions / seconds_measured, cycles / seconds_measured);
-		printf("  L1d loads/s=%.3g  load-miss=%.2f%%  mpki=%.2f\n",
-		       loads / seconds_measured,
-		       loads > 0 ? 100.0 * load_misses / loads : 0.0,
-		       instructions > 0 ? 1000.0 * load_misses / instructions : 0.0);
-		printf("  L1d stores/s=%.3g  store-miss=%.2f%%\n",
-		       stores / seconds_measured,
-		       stores > 0 ? 100.0 * store_misses / stores : 0.0);
-		printf("  beyond-L1 traffic estimate=%.0f MiB/s (misses x %d B cache line)\n",
+		printf("\nhardware saturation%s\n",
+		       watch_pid > 0 ? " (watched process only)" : " (system wide)");
+		for (int cluster = 0; cluster < 2; cluster++) {
+			if (cluster_cpus[cluster] == 0)
+				continue;
+			double cluster_cycles = (double)cluster_during[cluster][0];
+			double cluster_instructions = (double)cluster_during[cluster][1];
+			double cluster_loads = (double)cluster_during[cluster][2];
+			double cluster_load_misses = (double)cluster_during[cluster][3];
+			double cluster_stores = (double)cluster_during[cluster][4];
+			double cluster_store_misses = (double)cluster_during[cluster][5];
+			double cluster_traffic = (cluster_load_misses + cluster_store_misses) *
+						 CACHE_LINE_BYTES / seconds_measured /
+						 (1024.0 * 1024.0);
+
+			printf("  %s (%d cpus)%s\n", cluster == 0 ? "X100 0-7" : "A100 8-15",
+			       cluster_cpus[cluster],
+			       cluster == 1 ? "  [AI runtime cores; Linux accounting shows 0]" : "");
+			printf("    ipc=%.2f  instructions/s=%.3g  cycles/s=%.3g\n",
+			       cluster_cycles > 0 ? cluster_instructions / cluster_cycles : 0.0,
+			       cluster_instructions / seconds_measured,
+			       cluster_cycles / seconds_measured);
+			printf("    L1d loads/s=%.3g  load-miss=%.2f%%  mpki=%.2f\n",
+			       cluster_loads / seconds_measured,
+			       cluster_loads > 0 ? 100.0 * cluster_load_misses / cluster_loads : 0.0,
+			       cluster_instructions > 0
+				       ? 1000.0 * cluster_load_misses / cluster_instructions : 0.0);
+			printf("    L1d stores/s=%.3g  store-miss=%.2f%%  beyond-L1=%.0f MiB/s\n",
+			       cluster_stores / seconds_measured,
+			       cluster_stores > 0 ? 100.0 * cluster_store_misses / cluster_stores : 0.0,
+			       cluster_traffic);
+		}
+		printf("  combined beyond-L1 traffic estimate=%.0f MiB/s (misses x %d B cache line)\n",
 		       beyond_l1_mib_s, CACHE_LINE_BYTES);
 		if (peak_mib_s > 0.0)
 			printf("  estimated bus utilisation=%.1f%% of the supplied %.0f MiB/s peak\n",

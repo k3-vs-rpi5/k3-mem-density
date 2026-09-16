@@ -40,6 +40,24 @@ trace), so LLC-miss density and DDR saturation cannot be read directly. The
 beyond-L1 traffic estimate is the closest observable quantity and is always
 labelled as an estimate, never presented as a raw counter.
 
+## A100 (AI cluster) coverage and build parameters
+
+Cores 8-15 are the SpacemiT A100 AI cluster. Measured on the updated K3 board:
+
+- Linux cannot schedule ordinary tasks there (`taskset -c 8` and
+  `sched_setaffinity` fail with `EINVAL`), and `/proc/stat` reports zero user
+  and system time on cpu8-15 even while the AI runtime is initialising.
+- The hardware counters do move: system-wide `perf` on cpu8-15 shows cycles,
+  instructions and L1D activity, so the probe takes its A100 view from
+  per-CPU system-wide PMU counting and labels it as AI-runtime cores.
+- The vendor AI runtime confirms the split itself: `llama-bench` reports
+  `cpu_mask: ff00`, `aicpu_id_offset: 8`, `use_ime2: 1` and TCM blocks, i.e.
+  its operators run on cores 8-15.
+- Code that targets A100 must ask the compiler for it: both the workspace GCC
+  and clang-23 accept `-mcpu=spacemit-a100`, which selects the A100 scheduling
+  model and the vector ISA (clang also reports `__riscv_v`). Compiling A100
+  kernels without that parameter produces X100/generic code.
+
 ## How it works on this board
 
 The K3 kernel has no BTF (`CONFIG_DEBUG_INFO_BTF` unset, no

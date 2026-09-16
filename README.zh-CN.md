@@ -35,6 +35,23 @@
 直接读取。越过 L1 的流量估算是当前可观测的最近似量，且始终标注为估算值，绝不冒
 充为原始计数器。
 
+## A100（AI 簇）覆盖范围与编译参数
+
+8–15 号核是进迭时空的 A100 AI 簇。在更新后的 K3 板上实测：
+
+- Linux 无法把普通任务调度到这些核上（`taskset -c 8` 与 `sched_setaffinity`
+  返回 `EINVAL`），而且即使 AI 运行时正在初始化，`/proc/stat` 中 cpu8-15 的
+  user 与 system 时间仍为 0。
+- 但硬件计数器会动：对 cpu8-15 做系统级 `perf` 能看到 cycles、instructions 与
+  L1D 活动，因此探针的 A100 视图来自按 CPU 的系统级 PMU 计数，并标注为
+  AI 运行时核心。
+- 厂商 AI 运行时自己也印证了这个分工：`llama-bench` 输出
+  `cpu_mask: ff00`、`aicpu_id_offset: 8`、`use_ime2: 1` 与 TCM 块信息，即其算子
+  运行在 8–15 号核上。
+- 面向 A100 的代码必须让编译器显式指定：工作区 GCC 与 clang-23 都接受
+  `-mcpu=spacemit-a100`，它会选择 A100 调度模型与向量 ISA（clang 还会定义
+  `__riscv_v`）。不带该参数编译只会得到 X100/通用代码。
+
 ## 在本板上的实现方式
 
 K3 内核没有 BTF（未开启 `CONFIG_DEBUG_INFO_BTF`，也没有
