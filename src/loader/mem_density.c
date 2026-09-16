@@ -883,7 +883,7 @@ int main(int argc, char **argv)
 		memcpy(previous, current, sizeof(__u64) * TOTAL_SLOTS);
 	}
 	if (json)
-		fprintf(json, "]}");
+		fprintf(json, "]");   /* the summary and the closing brace follow */
 
 	__u64 width[ALLOC_BUCKETS] = { 0 }, orders[ORDER_BUCKETS] = { 0 };
 	read_array(bpf_map__fd(width_map), width, ALLOC_BUCKETS);
@@ -1172,7 +1172,7 @@ int main(int argc, char **argv)
 			fprintf(json, "%s\"%s\":%llu", slot ? "," : "", total_names[slot],
 				(unsigned long long)totals_now[slot]);
 		fprintf(json, "},\"attached_programs\":%d,\"unavailable_programs\":%d,"
-			      "\"samples\":%d,\"counters_moved\":%d}\n",
+			      "\"samples_total\":%d,\"counters_moved\":%d}\n",
 			attached, failed, samples, moved);
 		fclose(json);
 	}
