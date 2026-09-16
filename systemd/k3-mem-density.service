@@ -1,0 +1,15 @@
+[Unit]
+Description=K3 memory density monitor (eBPF)
+Documentation=file:///usr/local/share/doc/k3-mem-density/README.md
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/k3-mem-density/mem_density --object /usr/local/lib/k3-mem-density/mem_density.bpf.o --seconds 86400 --interval 10 --json /run/k3-mem-density/latest.json
+Restart=always
+RestartSec=5
+RuntimeDirectory=k3-mem-density
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target
