@@ -71,3 +71,15 @@ must be mode `0600` and is never printed.
   which is exactly what the page-order histogram shows.
 - Reclaim pressure is only visible when the board is actually under pressure;
   an idle board reports zero, which is correct rather than missing.
+
+## Workspace integration
+
+This repository lives at `hardware/k3-mem-density` and carries its own Git
+history. It is not listed in the workspace manifest yet, because the manifest
+resolves `k3-mem-density.git` from the shared remote and the first push still
+needs human approval. Once the remote repository exists, add this entry to
+`default.xml`:
+
+```xml
+<project name="k3-mem-density.git" path="hardware/k3-mem-density" />
+```

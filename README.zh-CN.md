@@ -63,3 +63,13 @@ Git 仓库之外。板卡访问使用工作区记录 `<workspace>/.ssh-k3`，该
 - 内存读写操作本身不可直接观测；工具改为报告缺页的读/写密度与读写系统调用密度。
 - 大块分配会绕过 `kmalloc`（直接走页分配器），这正是页 order 直方图所显示的。
 - 回收压力只在板卡真正有压力时可见；空闲板卡报告为 0 是正确结果，而不是缺失。
+
+## 工作区集成
+
+本仓库位于 `hardware/k3-mem-density`，自带 Git 历史。它目前还没有登记到工作区
+manifest 中，因为 manifest 会从共享远端解析 `k3-mem-density.git`，而首次 push
+仍需人工批准。远端仓库就绪后，把下面这行加入 `default.xml`：
+
+```xml
+<project name="k3-mem-density.git" path="hardware/k3-mem-density" />
+```
