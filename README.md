@@ -94,8 +94,8 @@ instead, and `--pid` restricts the hardware view to one process.
 | lock contention | 425 begins in 14 s (30/s) during the threaded allocation workload |
 | zone-locked page allocations | 913 k in 14 s (65 k/s), the buddy zone-lock path |
 | fragmentation fallbacks | 42, seen as order 0 falling back to order 4, 6 and 7 |
-| beyond-L1 traffic | 136-138 MiB/s at 1.0 % L1D load miss and MPKI 0.26-0.30 |
-| single-core streaming peak | 10151 MiB/s of read+write traffic |
+| beyond-L1 traffic | 136-157 MiB/s at 0.8-1.1 % L1D load miss, MPKI 0.15-0.30, i.e. 0.9-1.4 % of the calibrated peak |
+| streaming peak | 17771 MiB/s with 8 X100 threads, 10347 MiB/s with one thread (read+write) |
 
 ## Limitations
 

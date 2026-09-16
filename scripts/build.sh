@@ -38,7 +38,7 @@ mkdir -p "$OUT"
 
 "$TOOLCHAIN/bin/riscv64-unknown-linux-gnu-gcc" -O2 -Wall -Wextra \
     -I"$INCLUDE_DIR" --sysroot="$TOOLCHAIN/sysroot" \
-    -L"$LIBBPF_DIR" -o "$OUT/mem_density" "$ROOT/src/loader/mem_density.c" \
+    -L"$LIBBPF_DIR" -o "$OUT/mem_density" "$ROOT/src/loader/mem_density.c" -pthread \
     -lbpf -lelf -lz -lzstd \
     -Wl,-rpath-link="$LIBBPF_DIR" -Wl,-rpath,/usr/lib/riscv64-linux-gnu
 

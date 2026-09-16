@@ -15,14 +15,6 @@
 #include <time.h>
 #include <unistd.h>
 
-static double now_seconds(void)
-{
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return ts.tv_sec + ts.tv_nsec / 1e9;
-}
-
 static int workload_seconds = 5;
 static size_t block_bytes;
 static volatile int stop_flag;
@@ -45,13 +37,16 @@ static void *allocator(void *arg)
 		if (!buffer)
 			break;
 		memset(buffer, (int)(rounds & 0x7f), block_bytes);
+		/* rewrite from offset 0 so the scratch file stays bounded: the point is
+		 * the read/write path, not disk consumption */
 		if (fd >= 0 && (rounds & 0x3f) == 0)
-			(void)!write(fd, buffer, block_bytes);
+			(void)!pwrite(fd, buffer, block_bytes, 0);
 		free(buffer);
 		rounds++;
 	}
 	if (fd >= 0)
 		close(fd);
+	unlink(path);
 	return (void *)(intptr_t)rounds;
 }
 

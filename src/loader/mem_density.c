@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 /*
  * K3 memory-density loader.
  *
@@ -24,6 +27,8 @@
 #include <linux/types.h>
 #include <linux/perf_event.h>
 #include <signal.h>
+#include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,11 +47,6 @@
  * counters (verified: LLC-* and dTLB-* are not provided by this PMU), so the
  * tool derives the beyond-L1 traffic from the L1D miss counters, which is
  * exactly the traffic the LLC and the memory system see. */
-static const char *pmu_event_names[PMU_EVENTS] = {
-	"cycles", "instructions", "L1d_loads", "L1d_load_misses", "L1d_stores",
-	"L1d_store_misses",
-};
-
 /* PERF_TYPE_HW_CACHE config = id | (op << 8) | (result << 16) */
 #define K3_CACHE_CONFIG(id, op, result) \
 	((__u64)(id) | ((__u64)(op) << 8) | ((__u64)(result) << 16))
@@ -122,30 +122,70 @@ static void pmu_close_group(struct pmu_group *group)
 }
 
 /* Measure the achievable streaming bandwidth of this board so the probe can
- * report a utilisation figure. Read+write bytes over the elapsed time. */
-static double probe_stream_bandwidth(int seconds, int threads)
+ * report a utilisation figure. DDR saturation is an aggregate effect, so the
+ * probe runs one streaming thread per X100 core by default and reports the
+ * combined read+write traffic. */
+struct stream_worker {
+	int seconds;
+	size_t size;
+	unsigned long long passes;
+};
+
+static void *stream_thread(void *argument)
 {
-	size_t size = 64u * 1024u * 1024u;
-	unsigned char *buffer = malloc(size);
+	struct stream_worker *worker = argument;
+	unsigned char *buffer = malloc(worker->size);
 	struct timespec start, stamp;
-	unsigned long long passes = 0;
 	double elapsed;
 
 	if (!buffer)
-		return 0.0;
-	memset(buffer, 1, size);
+		return NULL;
+	memset(buffer, 1, worker->size);
 	clock_gettime(CLOCK_MONOTONIC, &start);
 	do {
-		for (size_t index = 0; index < size; index += CACHE_LINE_BYTES)
+		for (size_t index = 0; index < worker->size; index += CACHE_LINE_BYTES)
 			buffer[index] = (unsigned char)(buffer[index] + 1);
-		passes++;
+		worker->passes++;
 		clock_gettime(CLOCK_MONOTONIC, &stamp);
 		elapsed = (stamp.tv_sec - start.tv_sec) + (stamp.tv_nsec - start.tv_nsec) / 1e9;
-	} while (elapsed < seconds);
+	} while (elapsed < worker->seconds);
 	free(buffer);
-	(void)threads;
+	return NULL;
+}
+
+static double probe_stream_bandwidth(int seconds, int threads)
+{
+	pthread_t workers[64];
+	struct stream_worker specs[64];
+	unsigned long long passes = 0;
+	size_t size = 32u * 1024u * 1024u;
+	cpu_set_t mask;
+
+	if (threads < 1)
+		threads = 1;
+	if (threads > 64)
+		threads = 64;
+	/* keep the calibrating threads on the X100 performance cluster */
+	CPU_ZERO(&mask);
+	for (int cpu = 0; cpu < 8; cpu++)
+		CPU_SET(cpu, &mask);
+	(void)pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask);
+
+	for (int index = 0; index < threads; index++) {
+		specs[index].seconds = seconds;
+		specs[index].size = size;
+		specs[index].passes = 0;
+		if (pthread_create(&workers[index], NULL, stream_thread, &specs[index]) != 0) {
+			threads = index;
+			break;
+		}
+	}
+	for (int index = 0; index < threads; index++) {
+		pthread_join(workers[index], NULL);
+		passes += specs[index].passes;
+	}
 	/* each pass reads and writes one cache line per step */
-	return (double)passes * (double)size * 2.0 / elapsed / (1024.0 * 1024.0);
+	return (double)passes * (double)size * 2.0 / seconds / (1024.0 * 1024.0);
 }
 
 
@@ -647,7 +687,7 @@ int main(int argc, char **argv)
 	const char *json_path = NULL;
 	int seconds = 10, interval = 1, top = 5, check_only = 0;
 	double peak_mib_s = 0.0;
-	int probe_bandwidth = 0;
+	int probe_bandwidth = 0, bandwidth_threads = 8;
 	int watch_pid = 0;
 	struct bpf_object *object = NULL;
 	struct bpf_program *program;
@@ -673,6 +713,8 @@ int main(int argc, char **argv)
 			peak_mib_s = atof(argv[++index]);
 		else if (strcmp(argv[index], "--probe-bandwidth") == 0)
 			probe_bandwidth = 1;
+		else if (strcmp(argv[index], "--bandwidth-threads") == 0 && index + 1 < argc)
+			bandwidth_threads = atoi(argv[++index]);
 		else if (strcmp(argv[index], "--pid") == 0 && index + 1 < argc)
 			watch_pid = atoi(argv[++index]);
 		else {
@@ -685,9 +727,10 @@ int main(int argc, char **argv)
 	if (interval < 1)
 		interval = 1;
 	if (probe_bandwidth) {
-		double measured = probe_stream_bandwidth(seconds < 2 ? 2 : seconds, 1);
+		double measured = probe_stream_bandwidth(seconds < 2 ? 2 : seconds, bandwidth_threads);
 
-		printf("streaming bandwidth probe: %.0f MiB/s of read+write traffic\n", measured);
+		printf("streaming bandwidth probe: %.0f MiB/s of read+write traffic (%d threads)\n",
+		       measured, bandwidth_threads);
 		printf("use it to size the saturations: --peak-mib-s %.0f\n", measured);
 		return measured > 0.0 ? 0 : 1;
 	}
