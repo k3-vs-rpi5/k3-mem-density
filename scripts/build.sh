@@ -10,7 +10,7 @@ SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
 WORKSPACE=$(CDPATH='' cd -- "$ROOT/../.." && pwd)
 CLANG=${K3_MEM_CLANG:-clang-23}
-TOOLCHAIN=${K3_MEM_TOOLCHAIN:-$WORKSPACE/spacemit-toolchain-linux-glibc-x86_64-v1.2.2}
+TOOLCHAIN=${K3_MEM_TOOLCHAIN:-$WORKSPACE/spacemit-toolchain-linux-glibc-x86_64-v1.2.4}
 LIBBPF_DIR=${K3_MEM_LIBBPF_DIR:-$WORKSPACE/.local/k3-tools/riscv64/lib}
 INCLUDE_DIR=${K3_MEM_INCLUDE_DIR:-$WORKSPACE/.local/k3-tools/include}
 OUT=${K3_MEM_OUT:-$WORKSPACE/.local/k3-mem-density/build}
