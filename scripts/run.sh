@@ -77,6 +77,9 @@ fi
 
 SSHPASS=$secret
 export SSHPASS
+# A board whose address changed is reached without editing the credential
+# record: export K3_BOARD_HOST=<address> for this invocation.
+[ -n "${K3_BOARD_HOST:-}" ] && host=$K3_BOARD_HOST
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$WORKSPACE/.local/known_hosts \
 -o ConnectTimeout=20 -o NumberOfPasswordPrompts=1 -o PreferredAuthentications=password,publickey"
 DEST="$user@$host"
