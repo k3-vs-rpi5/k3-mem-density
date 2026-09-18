@@ -60,19 +60,63 @@ Cores 8-15 are the SpacemiT A100 AI cluster. Measured on the updated K3 board:
 
 ## How it works on this board
 
-The K3 kernel has no BTF (`CONFIG_DEBUG_INFO_BTF` unset, no
-`/sys/kernel/btf/vmlinux`) and bpftrace refuses to parse tracepoint arguments
-without it, so the probe is a set of ordinary tracepoint programs that read the
-trace-entry fields at fixed offsets taken from
-`/sys/kernel/tracing/events/<group>/<name>/format`. Before attaching anything,
-the loader verifies every offset it depends on and refuses to attach on a
-mismatch; that is also why the raw-tracepoint form is not used: the sizes this
-tool needs are fields the kernel computes into the entry, not tracepoint
-arguments.
+The probe is a set of tracepoint programs. Two objects are built from the same
+accounting:
+
+- `mem_density_core.bpf.o` is CO-RE: it takes the trace-entry structs from the
+  running kernel's own BTF (`/sys/kernel/btf/vmlinux`, generated into a
+  `vmlinux.h` by `hardware/k3-monitor/scripts/run.sh btf-pull`) and reads the
+  fields through `bpf_core_read`, so no offset is compiled in. Load it with
+  `--core`.
+- `mem_density.bpf.o` is the offset form: it reads the trace-entry fields at
+  fixed offsets taken from `/sys/kernel/tracing/events/<group>/<name>/format`,
+  and the loader verifies every offset it depends on and refuses to attach on a
+  mismatch. It is the fallback for a kernel without BTF.
+
+Two tracepoints stay on validated offsets even in the CO-RE object, and that is
+a measurement rather than a shortcut: this kernel's BTF carries no
+`trace_event_raw_page_fault_user/_kernel` (only the `btf_trace_*` prototypes)
+and ships `mm_vmscan_direct_reclaim_begin` as a `*_template` type, so those
+fields have no type information to resolve against.
+
+Raw tracepoints are not usable here: the sizes this tool needs are fields the
+kernel computes into the trace entry, not tracepoint arguments.
 
 The eBPF programs are compiled on the host with `clang-23 -target bpf`; the
 loader is cross-compiled with the workspace SpacemiT toolchain and links the
 board's own `libbpf`. Nothing has to be installed on the board.
+
+## Attachment, coverage and measurement notes
+
+Measured on the board rather than assumed, because each of these changes what a
+number means:
+
+- **One attach covers every CPU.** A tracepoint program is stored in the
+  tracepoint's own program array (`perf_event_attach_bpf_prog()` ->
+  `bpf_prog_array_copy()`, which keeps the array on `event->tp_event`), not in
+  the perf event. Attaching the same program to a second CPU's perf event
+  returns `EEXIST`, which is a duplicate, not a failure. Verified: with the
+  workload pinned to cpu 5 and the program attached through cpu 0's event only,
+  the collector counted 71,265 allocations and 63,838 faults against the
+  kernel's own perf counters at 71,436 and 64,212 (-0.2 % and -0.6 %).
+- **perf cannot count the same tracepoint at the same time.** While a BPF
+  program is attached, `trace_call_bpf()` consumes the event and
+  `perf_trace_run_bpf_submit()` skips the perf ring-buffer path, so
+  `perf stat -e kmem:kmalloc` reports exactly 0 for that tracepoint. Ground
+  truth has to be measured in a separate window.
+- **Two collectors can share one window.** `--align-at EPOCH` holds the
+  measurement start until a common wall-clock second, and both the per-tick
+  series and the summary are taken between that instant and the last sample, so
+  `summary == sum(ticks)` and an A/B comparison no longer measures attach-time
+  skew.
+- **Repeatability limit.** Two runs of the *same* object over one aligned
+  window agreed exactly on `kmem_cache_alloc`/`free`, `mm_page_alloc`/`free`,
+  page faults and `read_bytes` (0.00 %), within 0.1 % on allocation bytes, and
+  differed by up to 1.2 % on total allocation count. The whole residual sits in
+  the rare `kmalloc`/`kfree` family (about 7 % of events), where two runs of one
+  object differed by 16.9 % in one run - so that family carries no better than
+  a few-percent resolution, and a CO-RE-versus-offsets difference of the same
+  size (16.3 %) is that noise, not a port defect.
 
 ## Build, run, verify
 

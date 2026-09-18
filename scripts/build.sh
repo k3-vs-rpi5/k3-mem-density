@@ -36,6 +36,21 @@ mkdir -p "$OUT"
     -I/usr/include -I/usr/include/x86_64-linux-gnu \
     -c "$ROOT/src/bpf/mem_density.bpf.c" -o "$OUT/mem_density.bpf.o"
 
+# The CO-RE object is built only when a vmlinux.h generated from the board's own
+# BTF is available: it reads the trace-entry fields from that type information
+# instead of the offsets the object above was compiled with. Two tracepoints
+# keep the offset check because this kernel's BTF does not describe their raw
+# structs; the loader knows which is which.
+VMLINUX_H=${K3_MEM_VMLINUX_H:-$WORKSPACE/.local/btf/vmlinux.h}
+if [ -f "$VMLINUX_H" ]; then
+    "$CLANG" -target bpf -D__TARGET_ARCH_riscv -O2 -g -Wall \
+        -I"$(dirname "$VMLINUX_H")" -I"$INCLUDE_DIR" \
+        -c "$ROOT/src/bpf/mem_density_core.bpf.c" -o "$OUT/mem_density_core.bpf.o"
+    echo "core object: $OUT/mem_density_core.bpf.o (CO-RE, against $(basename "$VMLINUX_H"))"
+else
+    echo "core object: skipped; run hardware/k3-monitor/scripts/run.sh btf-pull first"
+fi
+
 "$TOOLCHAIN/bin/riscv64-unknown-linux-gnu-gcc" -O2 -Wall -Wextra \
     -I"$INCLUDE_DIR" --sysroot="$TOOLCHAIN/sysroot" \
     -L"$LIBBPF_DIR" -o "$OUT/mem_density" "$ROOT/src/loader/mem_density.c" -pthread \

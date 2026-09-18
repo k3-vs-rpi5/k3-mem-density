@@ -5,6 +5,8 @@
 #   run.sh --seconds N        bounded window
 #   run.sh --workload         also run the bundled allocation workload
 #   run.sh --check            load-only smoke test, non-zero on failure
+#   run.sh --core             load the CO-RE object (needs the board's BTF)
+#   run.sh --align-at EPOCH   hold the window until a common wall-clock second
 #   run.sh --evidence DIR     also copy the raw report into DIR (outside Git)
 #
 # The board credentials come from the workspace record <workspace>/.ssh-k3 and
@@ -21,6 +23,7 @@ STAGE=/tmp/k3-mem-density
 SECONDS_WINDOW=30
 WORKLOAD=0
 CHECK=0
+CORE=0
 EVIDENCE=
 EXTRA=
 while [ $# -gt 0 ]; do
@@ -28,12 +31,15 @@ while [ $# -gt 0 ]; do
         --seconds) SECONDS_WINDOW=$2; shift 2 ;;
         --workload) WORKLOAD=1; shift ;;
         --check) CHECK=1; shift ;;
+        --core) CORE=1; shift ;;
+        --align-at) EXTRA="$EXTRA --align-at $2"; shift 2 ;;
         --evidence) EVIDENCE=$2; shift 2 ;;
         --probe-bandwidth) EXTRA="$EXTRA --probe-bandwidth"; shift ;;
         --peak-mib-s) EXTRA="$EXTRA --peak-mib-s $2"; shift 2 ;;
         --pid) EXTRA="$EXTRA --pid $2"; shift 2 ;;
-        *) echo "usage: $0 [--seconds N] [--workload] [--check] [--probe-bandwidth]" >&2
-           echo "          [--peak-mib-s N] [--pid PID] [--evidence DIR]" >&2
+        *) echo "usage: $0 [--seconds N] [--workload] [--check] [--core]" >&2
+           echo "          [--align-at EPOCH] [--probe-bandwidth] [--peak-mib-s N]" >&2
+           echo "          [--pid PID] [--evidence DIR]" >&2
            exit 2 ;;
     esac
 done
@@ -44,6 +50,16 @@ for artifact in mem_density mem_density.bpf.o alloc_stress; do
         exit 1
     }
 done
+OBJECT=mem_density.bpf.o
+if [ "$CORE" = 1 ]; then
+    [ -f "$BUILD/mem_density_core.bpf.o" ] || {
+        echo "missing artifact $BUILD/mem_density_core.bpf.o; build first (needs" >&2
+        echo "the board's BTF: hardware/k3-monitor/scripts/run.sh btf-pull)" >&2
+        exit 1
+    }
+    OBJECT=mem_density_core.bpf.o
+    EXTRA="$EXTRA --core"
+fi
 command -v sshpass >/dev/null 2>&1 || { echo "sshpass is required" >&2; exit 1; }
 
 [ -r "$CREDENTIALS" ] || { echo "cannot read credentials: $CREDENTIALS" >&2; exit 1; }
@@ -73,15 +89,18 @@ remote "mkdir -p $STAGE"
 sshpass -e scp -q $SSH_OPTS \
     "$BUILD/mem_density" "$BUILD/mem_density.bpf.o" "$BUILD/alloc_stress" \
     "$DEST:$STAGE/"
+if [ "$CORE" = 1 ]; then
+    sshpass -e scp -q $SSH_OPTS "$BUILD/mem_density_core.bpf.o" "$DEST:$STAGE/"
+fi
 
 if [ "$CHECK" = 1 ]; then
-    if remote "cd $STAGE && ./mem_density --object ./mem_density.bpf.o --check $EXTRA"; then
+    if remote "cd $STAGE && ./mem_density --object ./$OBJECT --check $EXTRA"; then
         exit 0
     fi
     exit 1
 fi
 
-RUN="cd $STAGE && ./mem_density --object ./mem_density.bpf.o --seconds $SECONDS_WINDOW --json report.json $EXTRA"
+RUN="cd $STAGE && ./mem_density --object ./$OBJECT --seconds $SECONDS_WINDOW --json report.json $EXTRA"
 if [ "$WORKLOAD" = 1 ]; then
     # several concurrent allocators so SLUB/zone contention and fragmentation
     # show up instead of a single thread's private fast path

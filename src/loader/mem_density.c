@@ -38,7 +38,9 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-#define MAX_ATTACH_FDS 256
+/* 16 online CPUs x 18 programs = 288 perf events; keep the array large enough
+ * that every attached descriptor is retained, not only the first 256. */
+#define MAX_ATTACH_FDS 1024
 #define MAX_PMU_GROUPS 16
 #define PMU_EVENTS 6
 #define CACHE_LINE_BYTES 64
@@ -191,6 +193,17 @@ static double probe_stream_bandwidth(int seconds, int threads)
 
 static int attach_fds[MAX_ATTACH_FDS];
 static int attach_fd_count;
+/* Tracepoint programs are collected in the tracepoint's own program array
+ * (bpf_prog_array_copy(), kernel/bpf/core.c, keeps the array on
+ * event->tp_event), not in the perf event. One successful attach therefore
+ * runs the program for that tracepoint on every CPU; a second attach of the
+ * same program to the same tracepoint returns EEXIST. Measured on this board:
+ * with a workload pinned to cpu 5, the collector and the kernel's own perf
+ * counters agreed to 0.6 % while the program had been attached through cpu 0's
+ * event only. So the loop stops at the first success, and only a real
+ * (non-EEXIST) failure is an attach error. */
+static int attach_cpus_online;
+static int attach_errors;
 
 static int perf_event_open_wrapper(struct perf_event_attr *attr, int cpu)
 {
@@ -212,6 +225,10 @@ static int read_tracepoint_id(const char *group, const char *name)
 	fclose(file);
 	return id;
 }
+
+/* Set when the object being loaded is the CO-RE one: fields it resolves through
+ * BTF have no compiled-in offset to verify. */
+static int core_mode;
 
 /* Verify one field offset in the tracepoint format description; the compiled
  * programs read the entry at fixed offsets, so a mismatch must fail closed. */
@@ -293,6 +310,7 @@ static int attach_tracepoint(struct bpf_program *program, const char *group,
 	int cpu_count = online_cpus(cpus, 64);
 	int id = read_tracepoint_id(group, name);
 	int attached_here = 0;
+	int reported = 0;
 
 	if (id < 0) {
 		fprintf(stderr, "warning: tracepoint %s:%s has no id\n", group, name);
@@ -302,6 +320,7 @@ static int attach_tracepoint(struct bpf_program *program, const char *group,
 		cpus[0] = 0;
 		cpu_count = 1;
 	}
+	attach_cpus_online = cpu_count;
 	for (int index = 0; index < cpu_count; index++) {
 		struct perf_event_attr attr;
 
@@ -316,16 +335,39 @@ static int attach_tracepoint(struct bpf_program *program, const char *group,
 		if (fd < 0)
 			continue;
 		if (ioctl(fd, PERF_EVENT_IOC_SET_BPF, bpf_program__fd(program)) != 0) {
+			int set_errno = errno;
+
 			close(fd);
+			if (set_errno == EEXIST) {
+				/* Already in this tracepoint's program array: the program runs
+				 * on every CPU, so this is complete coverage. */
+				attached_here = cpu_count;
+				break;
+			}
+			attach_errors++;
+			if (reported < 3) {
+				fprintf(stderr, "warning: %s:%s on cpu %d: PERF_EVENT_IOC_SET_BPF: %s\n",
+					group, name, cpus[index], strerror(set_errno));
+				reported++;
+			}
 			continue;
 		}
 		if (ioctl(fd, PERF_EVENT_IOC_ENABLE, 0) != 0) {
+			attach_errors++;
+			if (reported < 3) {
+				fprintf(stderr, "warning: %s:%s on cpu %d: PERF_EVENT_IOC_ENABLE: %s\n",
+					group, name, cpus[index], strerror(errno));
+				reported++;
+			}
 			close(fd);
 			continue;
 		}
 		if (attach_fd_count < MAX_ATTACH_FDS)
 			attach_fds[attach_fd_count++] = fd;
-		attached_here++;
+		/* One attached perf event installs the program in the tracepoint's
+		 * program array, which is where every CPU runs it from. */
+		attached_here = cpu_count;
+		break;
 	}
 	if (attached_here == 0)
 		fprintf(stderr, "warning: cannot attach tracepoint %s:%s\n", group, name);
@@ -422,6 +464,7 @@ struct layout_expectation {
 	const char *section;      /* tp/<group>/<name> */
 	const char *field;
 	int offset;
+	int core_covered;         /* 1: the CO-RE object resolves this through BTF */
 };
 
 /* Every program reads trace-entry fields at fixed offsets, so the offsets each
@@ -430,18 +473,20 @@ struct layout_expectation {
  * tracepoint and the program must not run. Tracepoints without an entry here
  * are pure event counters and do not read any field. */
 static const struct layout_expectation expected_layouts[] = {
-	{ "tp/kmem/kmalloc", "bytes_alloc", 32 },
-	{ "tp/kmem/kmem_cache_alloc", "bytes_alloc", 40 },
-	{ "tp/kmem/mm_page_alloc", "order", 16 },
-	{ "tp/exceptions/page_fault_user", "error_code", 24 },
-	{ "tp/exceptions/page_fault_kernel", "error_code", 24 },
-	{ "tp/syscalls/sys_enter_read", "fd", 16 },
-	{ "tp/syscalls/sys_enter_read", "count", 32 },
-	{ "tp/syscalls/sys_enter_write", "fd", 16 },
-	{ "tp/syscalls/sys_enter_write", "count", 32 },
-	{ "tp/lock/contention_begin", "lock_addr", 8 },
-	{ "tp/kmem/mm_page_alloc_extfrag", "alloc_order", 16 },
-	{ "tp/kmem/mm_page_alloc_extfrag", "fallback_order", 20 },
+	{ "tp/kmem/kmalloc", "bytes_alloc", 32, 1 },
+	{ "tp/kmem/kmem_cache_alloc", "bytes_alloc", 40, 1 },
+	{ "tp/kmem/mm_page_alloc", "order", 16, 1 },
+	/* This kernel's BTF carries no raw struct for the page-fault tracepoints,
+	 * so those two keep the hand-verified offset even in the CO-RE object. */
+	{ "tp/exceptions/page_fault_user", "error_code", 24, 0 },
+	{ "tp/exceptions/page_fault_kernel", "error_code", 24, 0 },
+	{ "tp/syscalls/sys_enter_read", "fd", 16, 1 },
+	{ "tp/syscalls/sys_enter_read", "count", 32, 1 },
+	{ "tp/syscalls/sys_enter_write", "fd", 16, 1 },
+	{ "tp/syscalls/sys_enter_write", "count", 32, 1 },
+	{ "tp/lock/contention_begin", "lock_addr", 8, 1 },
+	{ "tp/kmem/mm_page_alloc_extfrag", "alloc_order", 16, 1 },
+	{ "tp/kmem/mm_page_alloc_extfrag", "fallback_order", 20, 1 },
 };
 
 static int verify_layout(const char *section, const char *group, const char *event)
@@ -451,6 +496,10 @@ static int verify_layout(const char *section, const char *group, const char *eve
 		const struct layout_expectation *expectation = &expected_layouts[index];
 
 		if (strcmp(expectation->section, section) != 0)
+			continue;
+		/* A CO-RE object reads this field through the kernel's own BTF, so the
+		 * compiled-in offset does not exist and there is nothing to verify. */
+		if (core_mode && expectation->core_covered)
 			continue;
 		if (verify_tracepoint_field(group, event, expectation->field,
 					    expectation->offset) != 1) {
@@ -689,10 +738,11 @@ int main(int argc, char **argv)
 	double peak_mib_s = 0.0;
 	int probe_bandwidth = 0, bandwidth_threads = 8;
 	int watch_pid = 0;
+	long long align_at = 0;
 	struct bpf_object *object = NULL;
 	struct bpf_program *program;
 	int attached = 0, failed = 0;
-	__u64 *previous = NULL, *current = NULL;
+	__u64 *previous = NULL, *current = NULL, *window_start = NULL;
 	FILE *json = NULL;
 	int exit_code = 0;
 
@@ -717,10 +767,14 @@ int main(int argc, char **argv)
 			bandwidth_threads = atoi(argv[++index]);
 		else if (strcmp(argv[index], "--pid") == 0 && index + 1 < argc)
 			watch_pid = atoi(argv[++index]);
+		else if (strcmp(argv[index], "--core") == 0)
+			core_mode = 1;
+		else if (strcmp(argv[index], "--align-at") == 0 && index + 1 < argc)
+			align_at = atoll(argv[++index]);
 		else {
 			fprintf(stderr, "usage: %s [--object PATH] [--seconds N] [--interval S] "
-					"[--top N] [--json PATH] [--check] [--probe-bandwidth] "
-					"[--peak-mib-s N]\n", argv[0]);
+					"[--top N] [--json PATH] [--check] [--core] [--probe-bandwidth] "
+					"[--peak-mib-s N] [--align-at EPOCH]\n", argv[0]);
 			return 2;
 		}
 	}
@@ -812,6 +866,8 @@ int main(int argc, char **argv)
 			      "\"samples\":[", interval);
 
 	printf("k3-mem-density: attached %d eBPF programs (%d unavailable)\n", attached, failed);
+	printf("k3-mem-density: tracepoint program arrays cover all %d online CPUs "
+	       "(%d attach errors)\n", attach_cpus_online, attach_errors);
 	int samples = 0;
 	struct timespec start, stamp;
 
@@ -840,6 +896,42 @@ int main(int argc, char **argv)
 		for (int index = 0; index < pmu_group_count; index++)
 			pmu_read_group(&pmu_groups[index], pmu_before[index]);
 
+	/* Two collectors that must be compared are given the same epoch: both then
+	 * open their measurement window at the same instant, so a difference is the
+	 * object's, not the attach-time skew between the two processes. */
+	if (align_at > 0) {
+		struct timespec now;
+
+		for (;;) {
+			long long remain_ns;
+			struct timespec request;
+
+			clock_gettime(CLOCK_REALTIME, &now);
+			remain_ns = (align_at - (long long)now.tv_sec) * 1000000000LL
+				    - now.tv_nsec;
+			if (remain_ns <= 0)
+				break;
+			request.tv_sec = remain_ns / 1000000000LL;
+			request.tv_nsec = remain_ns % 1000000000LL;
+			nanosleep(&request, NULL);
+		}
+	}
+
+	/* The window snapshot. The counters accumulate from object load, so the
+	 * attach-to-window period is subtracted out: the summary then describes the
+	 * measured window alone, the same span the per-tick samples cover. */
+	window_start = calloc(TOTAL_SLOTS, sizeof(__u64));
+	if (!window_start || read_totals(bpf_map__fd(totals_map), window_start) != 0) {
+		fprintf(stderr, "warning: cannot snapshot the window start; the summary "
+				"will include the attach period\n");
+		free(window_start);
+		window_start = NULL;
+	}
+	/* The first tick must measure its own second, not the attach period: the
+	 * delta baseline is the window-start snapshot, the same one the summary
+	 * subtracts, so the tick series and the summary add up. */
+	if (window_start)
+		memcpy(previous, window_start, sizeof(__u64) * TOTAL_SLOTS);
 	clock_gettime(CLOCK_MONOTONIC, &start);
 	for (int elapsed = 0; elapsed < seconds; elapsed += interval) {
 		sleep(interval);
@@ -882,6 +974,13 @@ int main(int argc, char **argv)
 		fflush(stdout);
 		memcpy(previous, current, sizeof(__u64) * TOTAL_SLOTS);
 	}
+	/* The window ends here, at the last sample, not after the reporting work
+	 * below: the summary and the tick series must describe the same span. */
+	__u64 totals_now[TOTAL_SLOTS] = { 0 };
+	struct timespec window_end;
+
+	clock_gettime(CLOCK_MONOTONIC, &window_end);
+	read_totals(bpf_map__fd(totals_map), totals_now);
 	if (json)
 		fprintf(json, "]");   /* the summary and the closing brace follow */
 
@@ -1159,21 +1258,24 @@ int main(int argc, char **argv)
 		printf("\nhardware saturation: PMU counters unavailable\n");
 	}
 
-	__u64 totals_now[TOTAL_SLOTS] = { 0 };
-	read_totals(bpf_map__fd(totals_map), totals_now);
 	int moved = 0;
 	for (int slot = 0; slot < TOTAL_SLOTS; slot++)
 		if (totals_now[slot] != 0)
 			moved++;
 
 	if (json) {
-		fprintf(json, ",\"summary\":{");
+		fprintf(json, ",\"window_start_ns\":%llu,\"window_end_ns\":%llu,\"summary\":{",
+			(unsigned long long)start.tv_sec * 1000000000ULL + start.tv_nsec,
+			(unsigned long long)window_end.tv_sec * 1000000000ULL + window_end.tv_nsec);
 		for (int slot = 0; slot < TOTAL_SLOTS; slot++)
 			fprintf(json, "%s\"%s\":%llu", slot ? "," : "", total_names[slot],
-				(unsigned long long)totals_now[slot]);
+				(unsigned long long)(totals_now[slot] -
+						     (window_start ? window_start[slot] : 0)));
 		fprintf(json, "},\"attached_programs\":%d,\"unavailable_programs\":%d,"
-			      "\"samples_total\":%d,\"counters_moved\":%d}\n",
-			attached, failed, samples, moved);
+			      "\"samples_total\":%d,\"counters_moved\":%d,"
+			      "\"cpus_online\":%d,\"attach_errors\":%d,"
+			      "\"attach_scope\":\"tracepoint_program_array\"}\n",
+			attached, failed, samples, moved, attach_cpus_online, attach_errors);
 		fclose(json);
 	}
 	if (check_only) {
@@ -1185,6 +1287,7 @@ int main(int argc, char **argv)
 	bpf_object__close(object);
 	free(previous);
 	free(current);
+	free(window_start);
 	free(symbols);
 	return exit_code;
 }

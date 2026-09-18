@@ -54,16 +54,51 @@
 
 ## 在本板上的实现方式
 
-K3 内核没有 BTF（未开启 `CONFIG_DEBUG_INFO_BTF`，也没有
-`/sys/kernel/btf/vmlinux`），而 bpftrace 在没有 BTF 时拒绝解析 tracepoint
-参数，因此探针由一组普通 tracepoint 程序构成，按
-`/sys/kernel/tracing/events/<group>/<name>/format` 中公布的固定偏移读取 trace
-条目字段。加载器在挂载前会逐一校验它依赖的每个偏移，不一致就拒绝挂载；这也是
-不使用 raw tracepoint 的原因：本工具需要的尺寸是内核计算进条目的字段，而不是
+探针是一组 tracepoint 程序，由同一套计量逻辑编译出两个对象：
+
+- `mem_density_core.bpf.o` 是 CO-RE 版本：从运行中的内核自身 BTF
+  （`/sys/kernel/btf/vmlinux`，由 `hardware/k3-monitor/scripts/run.sh
+  btf-pull` 生成 `vmlinux.h`）取 trace 条目结构，通过 `bpf_core_read` 读取
+  字段，因此不编译任何偏移。用 `--core` 加载。
+- `mem_density.bpf.o` 是偏移版本：按
+  `/sys/kernel/tracing/events/<group>/<name>/format` 中公布的固定偏移读取 trace
+  条目字段，加载器在挂载前逐一校验它依赖的每个偏移，不一致就拒绝挂载，是没有
+  BTF 的内核上的后备方案。
+
+即使 CO-RE 对象里也有两个 tracepoint 保留偏移校验，这是实测结论而非取巧：本内核
+BTF 中没有 `trace_event_raw_page_fault_user/_kernel`（只有 `btf_trace_*` 原型），
+`mm_vmscan_direct_reclaim_begin` 以 `*_template` 类型发布，这些字段没有可用于
+CO-RE 解析的类型信息。
+
+这里也不能使用 raw tracepoint：本工具需要的尺寸是内核计算进条目的字段，而不是
 tracepoint 的参数。
 
 eBPF 程序在主机上用 `clang-23 -target bpf` 编译；加载器用工作区 spacemit 工具链
 交叉编译，并链接板卡自带的 `libbpf`。板卡上无需安装任何东西。
+
+## 挂载、覆盖范围与测量说明
+
+以下均为板上实测而非推断，因为它们都改变数字的含义：
+
+- **一次挂载即覆盖全部 CPU。** tracepoint 程序存放在 tracepoint 自己的程序数组
+  里（`perf_event_attach_bpf_prog()` -> `bpf_prog_array_copy()`，数组挂在
+  `event->tp_event` 上），而不是存在于 perf event 中。把同一程序再挂到另一个
+  CPU 的 perf event 会返回 `EEXIST`，那是重复而不是失败。实测：把负载绑到 cpu 5，
+  程序只通过 cpu 0 的 event 挂载，收集器计得 71,265 次分配与 63,838 次缺页，
+  内核自身 perf 计数器为 71,436 与 64,212（-0.2 % 与 -0.6 %）。
+- **perf 无法在同一时刻统计同一 tracepoint。** 只要挂了 BPF 程序，
+  `trace_call_bpf()` 就会吃掉该事件，`perf_trace_run_bpf_submit()` 跳过 perf
+  ring-buffer 路径，于是 `perf stat -e kmem:kmalloc` 对该 tracepoint 报 0。
+  因此基准值必须在另一个时间窗内单独测量。
+- **两个收集器可以共用同一个时间窗。** `--align-at EPOCH` 让测量起点对齐到同一
+  个墙上时钟秒，逐 tick 序列与汇总都取自该时刻到最后一个采样点，于是
+  `summary == sum(ticks)`，A/B 比较不再测到挂载耗时差。
+- **重复性上限。** 同一对象的两次运行在同一对齐窗口内：`kmem_cache_alloc`/`free`、
+  `mm_page_alloc`/`free`、缺页与 `read_bytes` 完全一致（0.00 %），分配字节数
+  相差不超过 0.1 %，分配总次数最多相差 1.2 %。全部残差集中在占比约 7 % 的
+  `kmalloc`/`kfree` 家族——同一对象两次运行在该家族上就能相差 16.9 %——因此该
+  家族的分辨率只有百分之几，与此同量级的 CO-RE 与偏移版本差异（16.3 %）属于该
+  噪声，而不是移植缺陷。
 
 ## 构建、运行、验证
 
