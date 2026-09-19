@@ -57,9 +57,9 @@
 探针是一组 tracepoint 程序，由同一套计量逻辑编译出两个对象：
 
 - `mem_density_core.bpf.o` 是 CO-RE 版本：从运行中的内核自身 BTF
-  （`/sys/kernel/btf/vmlinux`，由 `hardware/k3-monitor/scripts/run.sh
-  btf-pull` 生成 `vmlinux.h`）取 trace 条目结构，通过 `bpf_core_read` 读取
-  字段，因此不编译任何偏移。用 `--core` 加载。
+  （`/sys/kernel/btf/vmlinux`，由 `hardware/k3-monitor/scripts/run.sh btf-pull`
+  生成 `vmlinux.h`）取 trace 条目结构，通过 `bpf_core_read` 读取字段，因此不
+  编译任何偏移。用 `--core` 加载。
 - `mem_density.bpf.o` 是偏移版本：按
   `/sys/kernel/tracing/events/<group>/<name>/format` 中公布的固定偏移读取 trace
   条目字段，加载器在挂载前逐一校验它依赖的每个偏移，不一致就拒绝挂载，是没有
